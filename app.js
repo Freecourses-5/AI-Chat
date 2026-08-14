@@ -19,8 +19,9 @@ const MODELS = {
 };
 
 let mode = "chat";
-let history = [];
-let previousInteractionId = localStorage.getItem("gemini_previous_id") || "";
+// history is now an array of Gemini "contents" objects: {role:"user"|"model", parts:[...]}
+// kept per-mode so switching between chat/vision/image doesn't mix contexts
+let histories = { chat: [], vision: [] };
 let attached = null;
 
 function key(){ return localStorage.getItem("gemini_api_key") || ""; }
@@ -99,37 +100,33 @@ function fileDataUrl(file){
   });
 }
 
-async function callInteractions(model,input,extra={}){
-  const body={model,input,...extra};
-  if(previousInteractionId && mode!=="image") body.previous_interaction_id=previousInteractionId;
-  const r=await fetch(`${API}/interactions`,{
-    method:"POST",
-    headers:{"Content-Type":"application/json","x-goog-api-key":key()},
-    body:JSON.stringify(body)
+// Calls the REAL Gemini API generateContent endpoint.
+// contents: array of {role, parts} objects (the full conversation so far, including the new user turn)
+// extra: optional extra fields merged into the request body (e.g. generationConfig)
+async function callGenerateContent(model, contents, extra={}){
+  const body = { contents, ...extra };
+  const r = await fetch(`${API}/models/${model}:generateContent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": key() },
+    body: JSON.stringify(body)
   });
-  const data=await r.json().catch(()=>({}));
+  const data = await r.json().catch(()=>({}));
   if(!r.ok) throw new Error(data?.error?.message || `HTTP ${r.status}`);
-  previousInteractionId=data.id || previousInteractionId;
-  if(previousInteractionId) localStorage.setItem("gemini_previous_id",previousInteractionId);
   return data;
 }
 
 function extractText(data){
-  if(data.output_text) return data.output_text;
-  const chunks=[];
-  for(const s of (data.steps||[])){
-    for(const c of (s.content||[])) if(c.type==="text" && c.text) chunks.push(c.text);
-  }
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  const chunks = parts.filter(p=>p.text).map(p=>p.text);
   return chunks.join("\n") || "لم يُرجع النموذج نصًا.";
 }
 
 function extractImage(data){
-  for(const s of (data.steps||[])){
-    for(const c of (s.content||[])){
-      if(c.type==="image" && c.data) return {data:c.data,mime:c.mime_type||"image/png"};
-    }
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  for(const p of parts){
+    if(p.inlineData?.data) return {data:p.inlineData.data, mime:p.inlineData.mimeType||"image/png"};
+    if(p.inline_data?.data) return {data:p.inline_data.data, mime:p.inline_data.mime_type||"image/png"};
   }
-  if(data.output_image?.data) return {data:data.output_image.data,mime:data.output_image.mime_type||"image/png"};
   return null;
 }
 
@@ -142,28 +139,44 @@ async function send(){
   $("prompt").value="";
   try{
     const model=$("model").value;
-    let input;
+    let extra = {};
+    let contents;
+
     if(mode==="vision"){
       if(!attached) throw new Error("أرفق صورة أولًا.");
       const b64=await fileToBase64(attached.file);
-      input=[
-        {type:"text",text:prompt || "حلل هذه الصورة بالتفصيل."},
-        {type:"image",data:b64,mime_type:attached.file.type}
+      const parts=[
+        {text: prompt || "حلل هذه الصورة بالتفصيل."},
+        {inlineData:{mimeType:attached.file.type, data:b64}}
       ];
+      histories.vision.push({role:"user", parts});
+      contents = histories.vision;
     }else if(mode==="image"){
-      input=[{type:"text",text:prompt || "أنشئ صورة جميلة."}];
+      // Image generation/editing turns are sent standalone (no running text history)
+      const parts=[{text: prompt || "أنشئ صورة جميلة."}];
+      if(attached){
+        const b64=await fileToBase64(attached.file);
+        parts.push({inlineData:{mimeType:attached.file.type, data:b64}});
+      }
+      contents=[{role:"user", parts}];
+      extra.generationConfig = { responseModalities: ["IMAGE","TEXT"] };
     }else{
-      input=prompt;
+      histories.chat.push({role:"user", parts:[{text:prompt}]});
+      contents = histories.chat;
     }
-    const data=await callInteractions(model,input, mode==="image" ? {
-      response_format:{type:"image",mime_type:"image/png"}
-    } : {});
+
+    const data = await callGenerateContent(model, contents, extra);
+
     if(mode==="image"){
       const img=extractImage(data);
       if(img) addImageMessage(img.data,img.mime);
       else addMessage("ai",extractText(data));
     }else{
-      addMessage("ai",extractText(data));
+      const text = extractText(data);
+      addMessage("ai",text);
+      // keep the model's reply in history so the conversation stays multi-turn
+      if(mode==="vision") histories.vision.push({role:"model", parts:[{text}]});
+      else histories.chat.push({role:"model", parts:[{text}]});
     }
     setStatus("تم");
     attached=null;$("imageInput").value="";showAttachment();
@@ -198,7 +211,7 @@ $("composer").addEventListener("submit",e=>{e.preventDefault();send()});
 $("apiBtn").onclick=openApi;$("apiMini").onclick=openApi;
 $("showKey").onclick=()=>{$("apiKey").type=$("apiKey").type==="password"?"text":"password";$("showKey").textContent=$("apiKey").type==="password"?"إظهار":"إخفاء"};
 $("saveKey").onclick=async e=>{e.preventDefault();if(await testKey()) $("apiDialog").close()};
-$("clearBtn").onclick=()=>{history=[];previousInteractionId="";localStorage.removeItem("gemini_previous_id");$("messages").innerHTML=`<div class="empty-state"><div class="empty-icon">✦</div><h3>ابدأ تجربة Gemini</h3><p>اختر نموذجًا من القائمة واكتب طلبك بالأسفل.</p></div>`;setStatus("تم المسح")};
+$("clearBtn").onclick=()=>{histories={chat:[],vision:[]};$("messages").innerHTML=`<div class="empty-state"><div class="empty-icon">✦</div><h3>ابدأ تجربة Gemini</h3><p>اختر نموذجًا من القائمة واكتب طلبك بالأسفل.</p></div>`;setStatus("تم المسح")};
 $("newChatBtn").onclick=()=>{$("clearBtn").click()};
 $("imageModeBtn").onclick=()=>setMode("image");
 $("model").onchange=updateModelInfo;
